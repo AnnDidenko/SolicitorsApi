@@ -1,0 +1,33 @@
+@SolicitorsApi_HostAddress = http://localhost:5156
+
+GET {{SolicitorsApi_HostAddress}}/api/solicitors/conveyancing/defaults
+Accept: application/json
+
+###
+
+POST {{SolicitorsApi_HostAddress}}/api/solicitors/conveyancing/search
+Content-Type: application/json
+Accept: application/json
+
+{
+  "locations": ["London", "Birmingham"],
+  "areaOfLaw": "Conveyancing",
+  "minimumReviewScore": 4.0,
+  "sort": {
+    "field": "ReviewScore",
+    "direction": "Descending"
+  },
+  "page": 1,
+  "pageSize": 10
+}
+
+###
+
+GET {{SolicitorsApi_HostAddress}}/api/solicitors/locations/suggestions?query=Lon
+Accept: application/json
+
+###
+
+GET {{SolicitorsApi_HostAddress}}/api/solicitors/zaiwalla-and-co-solicitors
+Accept: application/json
+
