@@ -1,0 +1,10 @@
+.git
+.agents
+.codex
+.vscode
+**/bin
+**/obj
+**/node_modules
+ClientApp/dist
+Dockerfile
+docker-compose*.yml

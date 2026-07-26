@@ -6,8 +6,9 @@ The application searches solicitors.com by location and optional area of law, su
 
 ## Prerequisites
 
-- .NET 10 SDK
-- Node.js and npm
+- Docker Desktop
+- .NET 10 SDK, for local development without Docker
+- Node.js and npm, for local SPA development without Docker
 - HTTPS development certificate trusted locally:
 
 ```powershell
@@ -15,6 +16,30 @@ dotnet dev-certs https --trust
 ```
 
 ## Run The Application
+
+### Docker
+
+Build and host the API and React SPA in one container:
+
+```powershell
+docker compose up --build
+```
+
+Open:
+
+```text
+http://localhost:8080
+```
+
+The Docker image builds `ClientApp` with Vite, publishes `SolicitorsApi`, copies the SPA into `wwwroot`, and serves both the frontend and `/api` routes from ASP.NET Core.
+
+To stop the container:
+
+```powershell
+docker compose down
+```
+
+### Local Development
 
 Start the API:
 

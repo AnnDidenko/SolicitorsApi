@@ -36,7 +36,10 @@ app.UseHttpsRedirection();
 app.UseMiddleware<RequestPerformanceMiddleware>();
 app.UseMiddleware<ApiExceptionHandlingMiddleware>();
 app.UseCors("SolicitorSearchSpa");
+app.UseDefaultFiles();
+app.UseStaticFiles();
 
 app.MapControllers();
+app.MapFallbackToFile("index.html");
 
 app.Run();
