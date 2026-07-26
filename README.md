@@ -79,6 +79,17 @@ Configuration lives in [appsettings.json](SolicitorsApi/appsettings.json).
 - `DefaultPageSize`
 - `ProfileFetchConcurrency`
 
+`SolicitorSearchCache` controls the temporary in-memory solicitor search cache:
+
+- `Enabled`
+- `ListTimeToLiveHours`
+- `ProfileTimeToLiveHours`
+- `MaxEntries`
+
+The first cache implementation is intentionally in-memory only. It does not add EF Core persistence, database tables, migrations, or database setup, and cached entries are lost when the API process restarts. The application cache ports keep the adapter replaceable for a future table-backed implementation. Scheduled refresh, user search history, and background change detection are deferred to later OpenSpec changes.
+
+Cache fallback does not add authentication or per-user cache isolation. Cache keys are derived from normalized search segments and normalized solicitor source identities, not raw caller-provided URLs. The cache stores parsed solicitor/list/profile data rather than raw HTML, and cache metadata is included in search responses so callers can see when fallback data was used.
+
 Area-of-law options are not hardcoded. They are scraped from solicitors.com and use the site's own `did` option values for area searches.
 
 Development CORS allows the Vite dev server through [appsettings.Development.json](SolicitorsApi/appsettings.Development.json).

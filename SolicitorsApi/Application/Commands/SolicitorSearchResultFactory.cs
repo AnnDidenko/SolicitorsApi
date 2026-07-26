@@ -22,11 +22,14 @@ public class SolicitorSearchResultFactory : ISolicitorSearchResultFactory
         RunConveyancingSolicitorSearchCommand command,
         SolicitorSearchExecutionContext context,
         IReadOnlyList<Solicitor> solicitors,
-        SolicitorSearchData searchData)
+        SolicitorSearchData searchData,
+        SolicitorSearchCacheMetadata? cacheMetadata = null)
     {
+        var searchedAt = cacheMetadata?.ServedAt ?? DateTimeOffset.UtcNow;
+
         return new SolicitorSearchResult
         {
-            SearchedAt = DateTimeOffset.UtcNow,
+            SearchedAt = searchedAt,
             Locations = context.Locations,
             UsedDefaultLocations = context.UsedDefaultLocations,
             AreaOfLaw = context.AreaOfLaw,
@@ -40,9 +43,16 @@ public class SolicitorSearchResultFactory : ISolicitorSearchResultFactory
                 solicitors,
                 command.Paging.Page,
                 command.Paging.PageSize),
-            LocationResults = searchData.LocationResults,
+            LocationResults = searchData.LocationResults
+                .Concat(context.NonBlockingFailures.Select(failure => new LocationSearchResult
+                {
+                    Location = failure.Location ?? string.Empty,
+                    Count = 0
+                }))
+                .ToArray(),
             Report = _reportBuilder.Build(solicitors, searchData.LocationResults),
-            Failures = searchData.Failures
+            Failures = context.NonBlockingFailures.Concat(searchData.Failures).ToArray(),
+            Cache = cacheMetadata
         };
     }
 }

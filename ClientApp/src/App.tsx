@@ -329,6 +329,11 @@ function App() {
           </header>
 
           {error && <div className="error-panel">{error}</div>}
+          {searchResult?.failures.length ? (
+            <div className="notice-panel">
+              {searchResult.failures.map((failure) => failure.message).join("\n")}
+            </div>
+          ) : null}
 
           <div className="table-wrap">
             <table>

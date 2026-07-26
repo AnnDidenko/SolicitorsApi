@@ -23,4 +23,6 @@ public class SolicitorSearchResult
     public SolicitorSearchReport Report { get; init; } = new();
 
     public IReadOnlyList<ScrapeFailure> Failures { get; init; } = [];
+
+    public SolicitorSearchCacheMetadata? Cache { get; init; }
 }

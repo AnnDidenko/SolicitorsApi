@@ -25,4 +25,6 @@ public sealed record SolicitorSearchResponse
     public SolicitorSearchReport Report { get; init; } = new();
 
     public IReadOnlyList<ScrapeFailure> Failures { get; init; } = [];
+
+    public SolicitorSearchCacheInfo? Cache { get; init; }
 }

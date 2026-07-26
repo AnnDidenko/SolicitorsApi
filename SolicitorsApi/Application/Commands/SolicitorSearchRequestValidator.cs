@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Options;
 using SolicitorsApi.Application.Ports;
+using SolicitorsApi.Domain;
 
 namespace SolicitorsApi.Application.Commands;
 
@@ -22,6 +23,7 @@ public class SolicitorSearchRequestValidator : ISolicitorSearchRequestValidator
         CancellationToken cancellationToken)
     {
         var errors = new List<ApplicationError>();
+        var locationErrors = await ValidateLocationsExistAsync(context, cancellationToken);
 
         if (context.Locations.Count > _settings.MaxLocations)
         {
@@ -39,7 +41,7 @@ public class SolicitorSearchRequestValidator : ISolicitorSearchRequestValidator
                 nameof(command.AreaOfLaw)));
         }
 
-        errors.AddRange(await ValidateLocationsExistAsync(context, cancellationToken));
+        errors.AddRange(locationErrors);
 
         return errors;
     }
@@ -54,15 +56,19 @@ public class SolicitorSearchRequestValidator : ISolicitorSearchRequestValidator
         }
 
         var errors = new List<ApplicationError>();
+        var validLocations = new List<string>();
+        var nonBlockingFailures = new List<ScrapeFailure>();
 
         foreach (var location in context.Locations)
         {
             if (location.Length < 3)
             {
-                errors.Add(new ApplicationError(
+                AddInvalidLocation(
+                    errors,
+                    nonBlockingFailures,
+                    location,
                     "locationTooShort",
-                    $"Location '{location}' must contain at least three characters.",
-                    nameof(RunConveyancingSolicitorSearchCommand.Locations)));
+                    $"Location '{location}' must contain at least three characters.");
                 continue;
             }
 
@@ -74,13 +80,45 @@ public class SolicitorSearchRequestValidator : ISolicitorSearchRequestValidator
 
             if (!exists)
             {
-                errors.Add(new ApplicationError(
+                AddInvalidLocation(
+                    errors,
+                    nonBlockingFailures,
+                    location,
                     "locationNotFound",
-                    $"City '{location}' does not exist.",
-                    nameof(RunConveyancingSolicitorSearchCommand.Locations)));
+                    $"City '{location}' does not exist.");
+                continue;
             }
+
+            validLocations.Add(location);
         }
 
-        return errors;
+        if (validLocations.Count == 0)
+        {
+            return errors;
+        }
+
+        context.Locations = validLocations;
+        context.NonBlockingFailures = nonBlockingFailures;
+
+        return [];
+    }
+
+    private static void AddInvalidLocation(
+        List<ApplicationError> errors,
+        List<ScrapeFailure> nonBlockingFailures,
+        string location,
+        string code,
+        string message)
+    {
+        errors.Add(new ApplicationError(
+            code,
+            message,
+            nameof(RunConveyancingSolicitorSearchCommand.Locations)));
+        nonBlockingFailures.Add(new ScrapeFailure
+        {
+            Location = location,
+            Code = code,
+            Message = message
+        });
     }
 }

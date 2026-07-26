@@ -24,7 +24,20 @@ internal static class SolicitorSearchResponseMappingExtensions
             Solicitors = result.Paging.Items.Select(ToResponse).ToArray(),
             LocationResults = result.LocationResults.Select(ToResponse).ToArray(),
             Report = result.Report.ToResponse(),
-            Failures = result.Failures.Select(ToResponse).ToArray()
+            Failures = result.Failures.Select(ToResponse).ToArray(),
+            Cache = result.Cache?.ToResponse()
+        };
+    }
+
+    private static SolicitorSearchCacheInfo ToResponse(this SolicitorSearchCacheMetadata metadata)
+    {
+        return new SolicitorSearchCacheInfo
+        {
+            Status = metadata.Status.ToString(),
+            UsedFallback = metadata.UsedFallback,
+            FetchedAt = metadata.FetchedAt,
+            ServedAt = metadata.ServedAt,
+            ExpiresAt = metadata.ExpiresAt
         };
     }
 

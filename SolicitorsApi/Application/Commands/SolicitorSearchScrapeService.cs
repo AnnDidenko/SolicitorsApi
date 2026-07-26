@@ -1,34 +1,37 @@
 using SolicitorsApi.Application.Ports;
 using SolicitorsApi.Domain;
+using System.Diagnostics;
 
 namespace SolicitorsApi.Application.Commands;
 
 public class SolicitorSearchScrapeService : ISolicitorSearchScrapeService
 {
     private readonly ISolicitorSearchGateway _solicitorSearchGateway;
+    private readonly ISearchPerformanceMetrics _metrics;
 
-    public SolicitorSearchScrapeService(ISolicitorSearchGateway solicitorSearchGateway)
+    public SolicitorSearchScrapeService(
+        ISolicitorSearchGateway solicitorSearchGateway,
+        ISearchPerformanceMetrics? metrics = null)
     {
         _solicitorSearchGateway = solicitorSearchGateway;
+        _metrics = metrics ?? NoOpSearchPerformanceMetrics.Instance;
     }
 
     public async Task<ApplicationResult<SolicitorSearchData>> SearchAsync(
         SolicitorSearchExecutionContext context,
         CancellationToken cancellationToken)
     {
+        var stopwatch = Stopwatch.StartNew();
+        var status = "success";
+
         var searchData = await _solicitorSearchGateway.SearchAsync(
             context.Locations,
             context.AreaOfLaw,
             cancellationToken);
 
-        if (searchData.Failures.Count > 0)
-        {
-            return ApplicationResult<SolicitorSearchData>.FailedDependency(
-                searchData.Failures.Select(failure => new ApplicationError(
-                    failure.Code,
-                    failure.Message,
-                    failure.Location)).ToArray());
-        }
+        stopwatch.Stop();
+        status = searchData.Failures.Count > 0 ? "partialFailure" : "success";
+        _metrics.RecordListFetch(context.Locations.Count, status, stopwatch.Elapsed);
 
         return ApplicationResult<SolicitorSearchData>.Ok(
             new SolicitorSearchData

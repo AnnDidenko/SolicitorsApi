@@ -9,5 +9,6 @@ public interface ISolicitorSearchResultFactory
         RunConveyancingSolicitorSearchCommand command,
         SolicitorSearchExecutionContext context,
         IReadOnlyList<Solicitor> solicitors,
-        SolicitorSearchData searchData);
+        SolicitorSearchData searchData,
+        SolicitorSearchCacheMetadata? cacheMetadata = null);
 }

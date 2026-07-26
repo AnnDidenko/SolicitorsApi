@@ -87,6 +87,13 @@ export type SolicitorSearchResponse = {
   locationResults: LocationSearchResult[];
   report: SolicitorSearchReport;
   failures: ScrapeFailure[];
+  cache?: {
+    status: string;
+    usedFallback: boolean;
+    fetchedAt?: string | null;
+    servedAt: string;
+    expiresAt?: string | null;
+  } | null;
 };
 
 export type LocationSuggestion = {

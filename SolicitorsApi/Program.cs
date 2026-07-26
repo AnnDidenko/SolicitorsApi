@@ -33,6 +33,7 @@ if (app.Environment.IsDevelopment())
 }
 
 app.UseHttpsRedirection();
+app.UseMiddleware<RequestPerformanceMiddleware>();
 app.UseMiddleware<ApiExceptionHandlingMiddleware>();
 app.UseCors("SolicitorSearchSpa");
 

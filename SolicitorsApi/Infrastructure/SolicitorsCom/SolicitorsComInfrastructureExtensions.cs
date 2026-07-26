@@ -1,10 +1,12 @@
 using Microsoft.Extensions.Options;
 using SolicitorsApi.Application.Ports;
+using SolicitorsApi.Infrastructure.Cache;
 using SolicitorsApi.Infrastructure.SolicitorsCom.Clients;
 using SolicitorsApi.Infrastructure.SolicitorsCom.Configuration;
 using SolicitorsApi.Infrastructure.SolicitorsCom.Gateways;
 using SolicitorsApi.Infrastructure.SolicitorsCom.Parsing;
 using SolicitorsApi.Infrastructure.SolicitorsCom.Routing;
+using SolicitorsApi.Infrastructure.Telemetry;
 
 namespace SolicitorsApi.Infrastructure.SolicitorsCom;
 
@@ -16,6 +18,8 @@ public static class SolicitorsComInfrastructureExtensions
     {
         services.Configure<SolicitorsComOptions>(
             configuration.GetSection(SolicitorsComOptions.SectionName));
+        services.Configure<SolicitorSearchCacheOptions>(
+            configuration.GetSection(SolicitorSearchCacheOptions.SectionName));
 
         services.AddSingleton<SolicitorsComUrlBuilder>();
         services.AddHttpClient<SolicitorsComSearchPageClient>(ConfigureHttpClient);
@@ -33,6 +37,9 @@ public static class SolicitorsComInfrastructureExtensions
         services.AddScoped<IAreaOfLawOptionsGateway, SolicitorsComAreaOfLawOptionsGateway>();
         services.AddScoped<ISolicitorSearchGateway, SolicitorsComSolicitorSearchGateway>();
         services.AddScoped<ISolicitorProfileGateway, SolicitorsComSolicitorProfileGateway>();
+        services.AddSingleton<ISolicitorSearchCache, MemorySolicitorSearchCache>();
+        services.AddSingleton<ISolicitorProfileCache, MemorySolicitorProfileCache>();
+        services.AddSingleton<ISearchPerformanceMetrics, SearchPerformanceMetrics>();
 
         return services;
     }

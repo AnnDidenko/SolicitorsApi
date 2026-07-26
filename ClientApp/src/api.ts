@@ -17,10 +17,37 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(text || `Request failed with status ${response.status}`);
+    throw new Error(formatErrorMessage(text, response.status));
   }
 
   return response.json() as Promise<T>;
+}
+
+function formatErrorMessage(text: string, status: number) {
+  if (!text) {
+    return "Request failed. Please try again.";
+  }
+
+  try {
+    const payload = JSON.parse(text) as {
+      detail?: string;
+      title?: string;
+      errors?: Record<string, string[]>;
+    };
+    const validationMessages = payload.errors
+      ? Object.values(payload.errors).flat().filter(Boolean)
+      : [];
+
+    if (validationMessages.length > 0) {
+      return [...new Set(validationMessages)].join("\n");
+    }
+
+    return payload.detail || payload.title || "Request failed. Please try again.";
+  } catch {
+    return status >= 500
+      ? "Something went wrong. Please try again."
+      : text;
+  }
 }
 
 export function getDefaults(): Promise<SolicitorSearchDefaultsResponse> {

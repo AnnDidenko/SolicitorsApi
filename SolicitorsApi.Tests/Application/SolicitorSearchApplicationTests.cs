@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Options;
 using System.ComponentModel.DataAnnotations;
 using SolicitorsApi.Application;
+using SolicitorsApi.Application.Cache;
 using SolicitorsApi.Application.Commands;
 using SolicitorsApi.Application.Ports;
 using SolicitorsApi.Application.Queries;
@@ -51,6 +52,22 @@ public class SolicitorSearchApplicationTests
     }
 
     [Test]
+    public async Task SearchCommand_CanBeConstructedWithCachePorts()
+    {
+        var gateway = new FakeSolicitorSearchGateway();
+        var handler = CreateHandler(
+            gateway,
+            new FakeSolicitorSearchCache(),
+            new FakeSolicitorProfileCache());
+
+        var result = await handler.HandleAsync(
+            new RunConveyancingSolicitorSearchCommand { Locations = ["London"] },
+            CancellationToken.None);
+
+        Assert.That(result.IsSuccess, Is.True);
+    }
+
+    [Test]
     public async Task SearchCommand_TrimsDeduplicatesAndAttemptsNonDefaultLocations()
     {
         var gateway = new FakeSolicitorSearchGateway();
@@ -92,7 +109,34 @@ public class SolicitorSearchApplicationTests
     }
 
     [Test]
-    public async Task SearchCommand_ReturnsValidationErrorForUnknownCity()
+    public async Task SearchCommand_ValidationFailureBypassesCache()
+    {
+        var searchCache = new FakeSolicitorSearchCache();
+        var profileCache = new FakeSolicitorProfileCache();
+        var handler = CreateHandler(
+            new FakeSolicitorSearchGateway(),
+            searchCache,
+            profileCache);
+
+        var result = await handler.HandleAsync(
+            new RunConveyancingSolicitorSearchCommand
+            {
+                Locations = ["London", "Leeds", "Bristol"]
+            },
+            CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(result.StatusCode, Is.EqualTo(StatusCodes.Status400BadRequest));
+            Assert.That(searchCache.ReadCount, Is.Zero);
+            Assert.That(searchCache.StoredSegments, Is.Empty);
+            Assert.That(profileCache.ReadCount, Is.Zero);
+            Assert.That(profileCache.DiscoveredRecords, Is.Empty);
+        });
+    }
+
+    [Test]
+    public async Task SearchCommand_ReturnsValidationErrorWhenAllCitiesAreUnknown()
     {
         var handler = CreateHandler(new FakeSolicitorSearchGateway());
 
@@ -108,6 +152,37 @@ public class SolicitorSearchApplicationTests
             Assert.That(result.StatusCode, Is.EqualTo(StatusCodes.Status400BadRequest));
             Assert.That(result.Errors.Single().Code, Is.EqualTo("locationNotFound"));
             Assert.That(result.Errors.Single().Message, Is.EqualTo("City 'Atlantis' does not exist."));
+        });
+    }
+
+    [Test]
+    public async Task SearchCommand_SearchesValidCitiesAndReportsUnknownCities()
+    {
+        var gateway = new FakeSolicitorSearchGateway
+        {
+            SearchData = new SolicitorSearchData
+            {
+                Solicitors = [Solicitor("London Firm", "London")],
+                LocationResults = [new LocationSearchResult { Location = "London", Count = 1 }]
+            }
+        };
+        var handler = CreateHandler(gateway);
+
+        var result = await handler.HandleAsync(
+            new RunConveyancingSolicitorSearchCommand
+            {
+                Locations = ["London", "Atlantis"]
+            },
+            CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(result.IsSuccess, Is.True);
+            Assert.That(gateway.SearchedLocations, Is.EqualTo(new[] { "London" }));
+            Assert.That(result.Value!.Locations, Is.EqualTo(new[] { "London" }));
+            Assert.That(result.Value.Failures.Single().Code, Is.EqualTo("locationNotFound"));
+            Assert.That(result.Value.Failures.Single().Location, Is.EqualTo("Atlantis"));
+            Assert.That(result.Value.LocationResults.Select(location => location.Location), Is.EquivalentTo(new[] { "London", "Atlantis" }));
         });
     }
 
@@ -153,7 +228,131 @@ public class SolicitorSearchApplicationTests
     }
 
     [Test]
-    public async Task SearchCommand_EnrichesProfilesOnlyForReviewFilteringOrSorting()
+    public async Task SearchCommand_ScrapeFailureReturnsCachedSegmentsWhenAllLocationsAreCached()
+    {
+        var fetchedAt = DateTimeOffset.UtcNow.AddHours(-1);
+        var searchCache = new FakeSolicitorSearchCache
+        {
+            Segments =
+            {
+                ["London|"] = new SolicitorListCacheEntry
+                {
+                    Location = "London",
+                    Solicitors = [Solicitor("Cached London Firm", "London")],
+                    LocationResults = [new LocationSearchResult { Location = "London", Count = 1 }],
+                    FetchedAt = fetchedAt,
+                    ExpiresAt = fetchedAt.AddHours(24)
+                }
+            }
+        };
+        var gateway = new FakeSolicitorSearchGateway
+        {
+            SearchData = new SolicitorSearchData
+            {
+                Failures =
+                [
+                    new ScrapeFailure
+                    {
+                        Location = "London",
+                        Code = "searchPageFailed",
+                        Message = "Upstream failed."
+                    }
+                ]
+            }
+        };
+        var handler = CreateHandler(gateway, searchCache);
+
+        var result = await handler.HandleAsync(
+            new RunConveyancingSolicitorSearchCommand { Locations = ["London"] },
+            CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(result.IsSuccess, Is.True);
+            Assert.That(result.Value!.Paging.Items.Single().Name, Is.EqualTo("Cached London Firm"));
+            Assert.That(gateway.SearchCount, Is.Zero);
+            Assert.That(result.Value.Cache!.Status, Is.EqualTo(SolicitorSearchCacheStatus.Fresh));
+            Assert.That(result.Value.Cache.UsedFallback, Is.False);
+            Assert.That(result.Value.Cache.FetchedAt, Is.EqualTo(fetchedAt));
+            Assert.That(result.Value.Paging.TotalCount, Is.EqualTo(1));
+        });
+    }
+
+    [Test]
+    public async Task SearchCommand_ScrapeFailureWithoutCachedSegmentReturnsFailedDependency()
+    {
+        var gateway = new FakeSolicitorSearchGateway
+        {
+            SearchData = new SolicitorSearchData
+            {
+                Failures =
+                [
+                    new ScrapeFailure
+                    {
+                        Location = "London",
+                        Code = "searchPageFailed",
+                        Message = "Upstream failed."
+                    }
+                ]
+            }
+        };
+        var handler = CreateHandler(gateway, new FakeSolicitorSearchCache());
+
+        var result = await handler.HandleAsync(
+            new RunConveyancingSolicitorSearchCommand { Locations = ["London"] },
+            CancellationToken.None);
+
+        Assert.That(result.StatusCode, Is.EqualTo(StatusCodes.Status424FailedDependency));
+    }
+
+    [Test]
+    public async Task SearchCommand_ScrapeFailureWithExpiredCachedSegmentReturnsFailedDependency()
+    {
+        var fetchedAt = DateTimeOffset.UtcNow.AddHours(-25);
+        var searchCache = new FakeSolicitorSearchCache
+        {
+            Segments =
+            {
+                ["London|"] = new SolicitorListCacheEntry
+                {
+                    Location = "London",
+                    Solicitors = [Solicitor("Expired London Firm", "London")],
+                    LocationResults = [new LocationSearchResult { Location = "London", Count = 1 }],
+                    FetchedAt = fetchedAt,
+                    ExpiresAt = fetchedAt.AddHours(24)
+                }
+            }
+        };
+        var gateway = new FakeSolicitorSearchGateway
+        {
+            SearchData = new SolicitorSearchData
+            {
+                Failures =
+                [
+                    new ScrapeFailure
+                    {
+                        Location = "London",
+                        Code = "searchPageFailed",
+                        Message = "Upstream failed."
+                    }
+                ]
+            }
+        };
+        var handler = CreateHandler(gateway, searchCache);
+
+        var result = await handler.HandleAsync(
+            new RunConveyancingSolicitorSearchCommand { Locations = ["London"] },
+            CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(result.StatusCode, Is.EqualTo(StatusCodes.Status424FailedDependency));
+            Assert.That(result.Errors.Single().Field, Is.EqualTo("London"));
+        });
+    }
+
+    [Test]
+    public async Task SearchCommand_UsesListReviewDataForReviewFilteringAndSorting()
     {
         var gateway = new FakeSolicitorSearchGateway
         {
@@ -190,10 +389,231 @@ public class SolicitorSearchApplicationTests
         Assert.Multiple(() =>
         {
             Assert.That(result.IsSuccess, Is.True);
-            Assert.That(gateway.ProfileFetchCount, Is.EqualTo(1));
-            Assert.That(result.Value!.Paging.Items.Select(solicitor => solicitor.Name), Is.EqualTo(new[] { "A Firm" }));
-            Assert.That(result.Value.Paging.Items.Single().Review!.Score, Is.EqualTo(4.8m));
+            Assert.That(gateway.ProfileFetchCount, Is.Zero);
+            Assert.That(result.Value!.Paging.Items.Select(solicitor => solicitor.Name), Is.EqualTo(new[] { "B Firm" }));
+            Assert.That(result.Value.Paging.Items.Single().Review!.Score, Is.EqualTo(5m));
             Assert.That(result.Value.Paging.TotalCount, Is.EqualTo(1));
+        });
+    }
+
+    [Test]
+    public async Task SearchCommand_ReusesCachedProfileDetailsForKnownSolicitors()
+    {
+        var fetchedAt = DateTimeOffset.UtcNow.AddHours(-1);
+        var profileCache = new FakeSolicitorProfileCache
+        {
+            Records =
+            {
+                ["slug:a-firm"] = new SolicitorProfileCacheRecord
+                {
+                    SourceIdentity = "slug:a-firm",
+                    Solicitor = Solicitor("A Firm", "London", reviewScore: 1m, reviewCount: 1, profileSlug: "a-firm"),
+                    Profile = Profile("A Firm", "a-firm", 4.8m, 20),
+                    LastSeenAt = fetchedAt,
+                    ProfileFetchedAt = fetchedAt,
+                    ExpiresAt = fetchedAt.AddHours(24)
+                }
+            }
+        };
+        var gateway = new FakeSolicitorSearchGateway
+        {
+            SearchData = new SolicitorSearchData
+            {
+                Solicitors = [Solicitor("A Firm", "London", reviewScore: 1m, reviewCount: 1, profileSlug: "a-firm")],
+                LocationResults = [new LocationSearchResult { Location = "London", Count = 1 }]
+            }
+        };
+        var handler = CreateHandler(gateway, profileCache: profileCache);
+
+        var result = await handler.HandleAsync(
+            new RunConveyancingSolicitorSearchCommand
+            {
+                Locations = ["London"],
+                MinimumReviewScore = 4,
+                Sort = new SolicitorSearchSortRequest
+                {
+                    Field = nameof(SolicitorSearchSortField.ReviewScore),
+                    Direction = nameof(SortDirection.Descending)
+                }
+            },
+            CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(result.IsSuccess, Is.True);
+            Assert.That(gateway.ProfileFetchCount, Is.Zero);
+            Assert.That(result.Value!.Paging.Items.Single().Review!.Score, Is.EqualTo(4.8m));
+        });
+    }
+
+    [Test]
+    public async Task SearchCommand_FetchesProfilesOnlyForNewMissingOrStaleRecords()
+    {
+        var fetchedAt = DateTimeOffset.UtcNow.AddHours(-1);
+        var expiredAt = DateTimeOffset.UtcNow.AddHours(-25);
+        var profileCache = new FakeSolicitorProfileCache
+        {
+            Records =
+            {
+                ["slug:cached-firm"] = new SolicitorProfileCacheRecord
+                {
+                    SourceIdentity = "slug:cached-firm",
+                    Solicitor = Solicitor("Cached Firm", "London", profileSlug: "cached-firm"),
+                    Profile = Profile("Cached Firm", "cached-firm", 4.8m, 20),
+                    LastSeenAt = fetchedAt,
+                    ProfileFetchedAt = fetchedAt,
+                    ExpiresAt = fetchedAt.AddHours(24)
+                },
+                ["slug:stale-firm"] = new SolicitorProfileCacheRecord
+                {
+                    SourceIdentity = "slug:stale-firm",
+                    Solicitor = Solicitor("Stale Firm", "London", profileSlug: "stale-firm"),
+                    Profile = Profile("Stale Firm", "stale-firm", 4.4m, 8),
+                    LastSeenAt = expiredAt,
+                    ProfileFetchedAt = expiredAt,
+                    ExpiresAt = expiredAt.AddHours(24)
+                },
+                ["slug:missing-profile-firm"] = new SolicitorProfileCacheRecord
+                {
+                    SourceIdentity = "slug:missing-profile-firm",
+                    Solicitor = Solicitor("Missing Profile Firm", "London", profileSlug: "missing-profile-firm"),
+                    LastSeenAt = fetchedAt,
+                    ExpiresAt = fetchedAt.AddHours(24)
+                }
+            }
+        };
+        var gateway = new FakeSolicitorSearchGateway
+        {
+            SearchData = new SolicitorSearchData
+            {
+                Solicitors =
+                [
+                    Solicitor("Cached Firm", "London", profileSlug: "cached-firm"),
+                    Solicitor("Stale Firm", "London", profileSlug: "stale-firm"),
+                    Solicitor("Missing Profile Firm", "London", profileSlug: "missing-profile-firm"),
+                    Solicitor("New Firm", "London", profileSlug: "new-firm")
+                ],
+                LocationResults = [new LocationSearchResult { Location = "London", Count = 4 }]
+            },
+            Profiles = new Dictionary<string, SolicitorProfile>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["stale-firm"] = Profile("Stale Firm", "stale-firm", 4.5m, 9),
+                ["missing-profile-firm"] = Profile("Missing Profile Firm", "missing-profile-firm", 4.6m, 10),
+                ["new-firm"] = Profile("New Firm", "new-firm", 4.7m, 11)
+            }
+        };
+        var handler = CreateHandler(gateway, profileCache: profileCache);
+
+        var result = await handler.HandleAsync(
+            new RunConveyancingSolicitorSearchCommand
+            {
+                Locations = ["London"],
+                MinimumReviewScore = 4
+            },
+            CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(result.IsSuccess, Is.True);
+            Assert.That(gateway.ProfileFetchCount, Is.EqualTo(1));
+            Assert.That(gateway.LastProfileFetchSolicitors.Select(solicitor => solicitor.Name), Is.EqualTo(new[] { "Stale Firm", "Missing Profile Firm", "New Firm" }));
+            Assert.That(result.Value!.Paging.TotalCount, Is.EqualTo(4));
+        });
+    }
+
+    [Test]
+    public async Task SearchCommand_ProfileCacheMissingReviewDataIsMissAndFetchFailureReturnsFailedDependency()
+    {
+        var fetchedAt = DateTimeOffset.UtcNow.AddHours(-1);
+        var profileCache = new FakeSolicitorProfileCache
+        {
+            Records =
+            {
+                ["slug:a-firm"] = new SolicitorProfileCacheRecord
+                {
+                    SourceIdentity = "slug:a-firm",
+                    Solicitor = Solicitor("A Firm", "London", profileSlug: "a-firm"),
+                    Profile = new SolicitorProfile
+                    {
+                        Name = "A Firm",
+                        Slug = "a-firm"
+                    },
+                    LastSeenAt = fetchedAt,
+                    ProfileFetchedAt = fetchedAt,
+                    ExpiresAt = fetchedAt.AddHours(24)
+                }
+            }
+        };
+        var gateway = new FakeSolicitorSearchGateway
+        {
+            ThrowOnProfileFetch = true,
+            SearchData = new SolicitorSearchData
+            {
+                Solicitors = [Solicitor("A Firm", "London", profileSlug: "a-firm")],
+                LocationResults = [new LocationSearchResult { Location = "London", Count = 1 }]
+            }
+        };
+        var handler = CreateHandler(gateway, profileCache: profileCache);
+
+        var result = await handler.HandleAsync(
+            new RunConveyancingSolicitorSearchCommand
+            {
+                Locations = ["London"],
+                MinimumReviewScore = 4
+            },
+            CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(result.StatusCode, Is.EqualTo(StatusCodes.Status424FailedDependency));
+            Assert.That(result.Errors.Single().Code, Is.EqualTo("profileEnrichmentFailed"));
+            Assert.That(gateway.ProfileFetchCount, Is.EqualTo(1));
+        });
+    }
+
+    [Test]
+    public async Task SearchCommand_ProfileEnrichmentFailureReturnsCachedMatchingProfiles()
+    {
+        var fetchedAt = DateTimeOffset.UtcNow.AddHours(-1);
+        var profileCache = new FakeSolicitorProfileCache
+        {
+            Records =
+            {
+                ["slug:a-firm"] = new SolicitorProfileCacheRecord
+                {
+                    SourceIdentity = "slug:a-firm",
+                    Solicitor = Solicitor("A Firm", "London", profileSlug: "a-firm"),
+                    Profile = Profile("A Firm", "a-firm", 4.8m, 20),
+                    LastSeenAt = fetchedAt,
+                    ProfileFetchedAt = fetchedAt,
+                    ExpiresAt = fetchedAt.AddHours(24)
+                }
+            }
+        };
+        var gateway = new FakeSolicitorSearchGateway
+        {
+            ThrowOnProfileFetch = true,
+            SearchData = new SolicitorSearchData
+            {
+                Solicitors = [Solicitor("A Firm", "London", profileSlug: "a-firm")],
+                LocationResults = [new LocationSearchResult { Location = "London", Count = 1 }]
+            }
+        };
+        var handler = CreateHandler(gateway, profileCache: profileCache);
+
+        var result = await handler.HandleAsync(
+            new RunConveyancingSolicitorSearchCommand
+            {
+                Locations = ["London"],
+                MinimumReviewScore = 4
+            },
+            CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(result.IsSuccess, Is.True);
+            Assert.That(gateway.ProfileFetchCount, Is.Zero);
+            Assert.That(result.Value!.Paging.Items.Single().Review!.Score, Is.EqualTo(4.8m));
         });
     }
 
@@ -228,6 +648,353 @@ public class SolicitorSearchApplicationTests
             Assert.That(result.Value!.Paging.Items.Select(solicitor => solicitor.Name), Is.EqualTo(new[] { "A Firm", "B Firm" }));
             Assert.That(result.Value.Paging.TotalCount, Is.EqualTo(2));
             Assert.That(result.Value.Report.TotalSolicitors, Is.EqualTo(2));
+        });
+    }
+
+    [Test]
+    public async Task SearchCommand_SuccessfulLiveSearchWritesListAndDiscoveredProfileCache()
+    {
+        var searchCache = new FakeSolicitorSearchCache();
+        var profileCache = new FakeSolicitorProfileCache();
+        var gateway = new FakeSolicitorSearchGateway
+        {
+            SearchData = new SolicitorSearchData
+            {
+                Solicitors =
+                [
+                    Solicitor("A Firm", "London", profileSlug: "a-firm"),
+                    Solicitor("B Firm", "Birmingham", profileSlug: "b-firm")
+                ],
+                LocationResults =
+                [
+                    new LocationSearchResult { Location = "London", Count = 1 },
+                    new LocationSearchResult { Location = "Birmingham", Count = 1 }
+                ]
+            }
+        };
+        var handler = CreateHandler(gateway, searchCache, profileCache);
+
+        var result = await handler.HandleAsync(
+            new RunConveyancingSolicitorSearchCommand
+            {
+                Locations = ["London", "Birmingham"]
+            },
+            CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(result.IsSuccess, Is.True);
+            Assert.That(searchCache.StoredSegments.Select(segment => segment.Location), Is.EqualTo(new[] { "London", "Birmingham" }));
+            Assert.That(searchCache.StoredSegments.Single(segment => segment.Location == "London").Solicitors.Single().Name, Is.EqualTo("A Firm"));
+            Assert.That(profileCache.DiscoveredRecords.Select(record => record.SourceIdentity), Is.EquivalentTo(new[] { "slug:a-firm", "slug:b-firm" }));
+            Assert.That(result.Value!.Cache!.Status, Is.EqualTo(SolicitorSearchCacheStatus.Fresh));
+            Assert.That(result.Value.Cache.UsedFallback, Is.False);
+        });
+    }
+
+    [Test]
+    public async Task SearchCommand_UsesFreshListCacheForRepeatedReviewSortSearch()
+    {
+        var fetchedAt = DateTimeOffset.UtcNow.AddMinutes(-5);
+        var searchCache = new FakeSolicitorSearchCache
+        {
+            Segments =
+            {
+                ["London|"] = new SolicitorListCacheEntry
+                {
+                    Location = "London",
+                    Solicitors =
+                    [
+                        Solicitor("A Firm", "London", reviewScore: 4.1m, reviewCount: 10, profileSlug: "a-firm"),
+                        Solicitor("B Firm", "London", reviewScore: 4.9m, reviewCount: 20, profileSlug: "b-firm")
+                    ],
+                    LocationResults = [new LocationSearchResult { Location = "London", Count = 2 }],
+                    FetchedAt = fetchedAt,
+                    ExpiresAt = fetchedAt.AddHours(24)
+                }
+            }
+        };
+        var gateway = new FakeSolicitorSearchGateway
+        {
+            SearchData = new SolicitorSearchData
+            {
+                Solicitors = [Solicitor("Live Firm", "London", reviewScore: 5m, reviewCount: 1, profileSlug: "live-firm")],
+                LocationResults = [new LocationSearchResult { Location = "London", Count = 1 }]
+            }
+        };
+        var handler = CreateHandler(gateway, searchCache);
+
+        var result = await handler.HandleAsync(
+            new RunConveyancingSolicitorSearchCommand
+            {
+                Locations = ["London"],
+                Sort = new SolicitorSearchSortRequest
+                {
+                    Field = nameof(SolicitorSearchSortField.ReviewScore),
+                    Direction = nameof(SortDirection.Descending)
+                }
+            },
+            CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(result.IsSuccess, Is.True);
+            Assert.That(gateway.SearchCount, Is.Zero);
+            Assert.That(gateway.ProfileFetchCount, Is.Zero);
+            Assert.That(result.Value!.Paging.Items.Select(solicitor => solicitor.Name), Is.EqualTo(new[] { "B Firm", "A Firm" }));
+            Assert.That(result.Value.Cache!.UsedFallback, Is.False);
+            Assert.That(result.Value.Cache.FetchedAt, Is.EqualTo(fetchedAt));
+        });
+    }
+
+    [Test]
+    public async Task SearchCommand_ReusesCachedLondonSegmentWhenExpandedSearchHasLiveBirmingham()
+    {
+        var fetchedAt = DateTimeOffset.UtcNow.AddHours(-1);
+        var searchCache = new FakeSolicitorSearchCache
+        {
+            Segments =
+            {
+                ["London|"] = new SolicitorListCacheEntry
+                {
+                    Location = "London",
+                    Solicitors = [Solicitor("Cached London Firm", "London")],
+                    LocationResults = [new LocationSearchResult { Location = "London", Count = 1 }],
+                    FetchedAt = fetchedAt,
+                    ExpiresAt = fetchedAt.AddHours(24)
+                }
+            }
+        };
+        var gateway = new FakeSolicitorSearchGateway
+        {
+            SearchData = new SolicitorSearchData
+            {
+                Solicitors = [Solicitor("Live Birmingham Firm", "Birmingham")],
+                LocationResults =
+                [
+                    new LocationSearchResult { Location = "London", Count = 0 },
+                    new LocationSearchResult { Location = "Birmingham", Count = 1 }
+                ],
+                Failures =
+                [
+                    new ScrapeFailure
+                    {
+                        Location = "London",
+                        Code = "searchPageFailed",
+                        Message = "Upstream failed."
+                    }
+                ]
+            }
+        };
+        var handler = CreateHandler(gateway, searchCache);
+
+        var result = await handler.HandleAsync(
+            new RunConveyancingSolicitorSearchCommand { Locations = ["London", "Birmingham"] },
+            CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(result.IsSuccess, Is.True);
+            Assert.That(result.Value!.Paging.Items.Select(solicitor => solicitor.Name), Is.EquivalentTo(new[] { "Cached London Firm", "Live Birmingham Firm" }));
+            Assert.That(result.Value.LocationResults.Select(location => location.Location), Is.EquivalentTo(new[] { "London", "Birmingham" }));
+            Assert.That(result.Value.Cache!.UsedFallback, Is.True);
+        });
+    }
+
+    [Test]
+    public async Task SearchCommand_ReusesCachedProfileDetailsForAreaFilteredKnownSolicitor()
+    {
+        var fetchedAt = DateTimeOffset.UtcNow.AddHours(-1);
+        var profileCache = new FakeSolicitorProfileCache
+        {
+            Records =
+            {
+                ["slug:family-firm"] = new SolicitorProfileCacheRecord
+                {
+                    SourceIdentity = "slug:family-firm",
+                    Solicitor = Solicitor("Family Firm", "London", profileSlug: "family-firm"),
+                    Profile = Profile("Family Firm", "family-firm", 4.8m, 20),
+                    LastSeenAt = fetchedAt,
+                    ProfileFetchedAt = fetchedAt,
+                    ExpiresAt = fetchedAt.AddHours(24)
+                }
+            }
+        };
+        var gateway = new FakeSolicitorSearchGateway
+        {
+            SearchData = new SolicitorSearchData
+            {
+                Solicitors = [Solicitor("Family Firm", "London", profileSlug: "family-firm")],
+                LocationResults = [new LocationSearchResult { Location = "London", Count = 1 }]
+            }
+        };
+        var handler = CreateHandler(gateway, profileCache: profileCache);
+
+        var result = await handler.HandleAsync(
+            new RunConveyancingSolicitorSearchCommand
+            {
+                Locations = ["London"],
+                AreaOfLaw = "Conveyancing",
+                MinimumReviewScore = 4
+            },
+            CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(result.IsSuccess, Is.True);
+            Assert.That(gateway.ProfileFetchCount, Is.Zero);
+            Assert.That(gateway.SearchedAreaOfLaw?.Slug, Is.EqualTo("conveyancing"));
+            Assert.That(result.Value!.Paging.Items.Single().Review!.Score, Is.EqualTo(4.8m));
+        });
+    }
+
+    [Test]
+    public async Task SearchCommand_ShapesFilteredSortedReportAndPagedResultAfterLiveCacheAssembly()
+    {
+        var fetchedAt = DateTimeOffset.UtcNow.AddHours(-1);
+        var searchCache = new FakeSolicitorSearchCache
+        {
+            Segments =
+            {
+                ["London|"] = new SolicitorListCacheEntry
+                {
+                    Location = "London",
+                    Solicitors =
+                    [
+                        Solicitor("Cached Top Firm", "London", reviewScore: 5m, reviewCount: 20),
+                        Solicitor("Cached Low Firm", "London", reviewScore: 2m, reviewCount: 2)
+                    ],
+                    LocationResults = [new LocationSearchResult { Location = "London", Count = 2 }],
+                    FetchedAt = fetchedAt,
+                    ExpiresAt = fetchedAt.AddHours(24)
+                }
+            }
+        };
+        var gateway = new FakeSolicitorSearchGateway
+        {
+            SearchData = new SolicitorSearchData
+            {
+                Solicitors =
+                [
+                    Solicitor("Live Middle Firm", "Birmingham", reviewScore: 4m, reviewCount: 12),
+                    Solicitor("Live Low Firm", "Birmingham", reviewScore: 3m, reviewCount: 3)
+                ],
+                LocationResults =
+                [
+                    new LocationSearchResult { Location = "London", Count = 0 },
+                    new LocationSearchResult { Location = "Birmingham", Count = 2 }
+                ],
+                Failures =
+                [
+                    new ScrapeFailure
+                    {
+                        Location = "London",
+                        Code = "searchPageFailed",
+                        Message = "Upstream failed."
+                    }
+                ]
+            }
+        };
+        var handler = CreateHandler(gateway, searchCache);
+
+        var result = await handler.HandleAsync(
+            new RunConveyancingSolicitorSearchCommand
+            {
+                Locations = ["London", "Birmingham"],
+                MinimumReviewScore = 4,
+                Sort = new SolicitorSearchSortRequest
+                {
+                    Field = nameof(SolicitorSearchSortField.ReviewScore),
+                    Direction = nameof(SortDirection.Descending)
+                },
+                Paging = new PagedSearchRequest
+                {
+                    Page = 1,
+                    PageSize = 1
+                }
+            },
+            CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(result.IsSuccess, Is.True);
+            Assert.That(result.Value!.Paging.TotalCount, Is.EqualTo(2));
+            Assert.That(result.Value.Paging.Items.Single().Name, Is.EqualTo("Cached Top Firm"));
+            Assert.That(result.Value.Report.TotalSolicitors, Is.EqualTo(2));
+            Assert.That(result.Value.Report.CountsByLocation.Keys, Is.EquivalentTo(new[] { "London", "Birmingham" }));
+        });
+    }
+
+    [Test]
+    public async Task SearchCommand_RecordsSearchListProfileAndFallbackMetricsWithoutPayloads()
+    {
+        var metrics = new FakeSearchPerformanceMetrics();
+        var fetchedAt = DateTimeOffset.UtcNow.AddHours(-1);
+        var searchCache = new FakeSolicitorSearchCache
+        {
+            Segments =
+            {
+                ["London|"] = new SolicitorListCacheEntry
+                {
+                    Location = "London",
+                    Solicitors = [Solicitor("Cached London Firm", "London", profileSlug: "cached-london-firm")],
+                    LocationResults = [new LocationSearchResult { Location = "London", Count = 1 }],
+                    FetchedAt = fetchedAt,
+                    ExpiresAt = fetchedAt.AddHours(24)
+                }
+            }
+        };
+        var profileCache = new FakeSolicitorProfileCache
+        {
+            Records =
+            {
+                ["slug:cached-london-firm"] = new SolicitorProfileCacheRecord
+                {
+                    SourceIdentity = "slug:cached-london-firm",
+                    Solicitor = Solicitor("Cached London Firm", "London", profileSlug: "cached-london-firm"),
+                    Profile = Profile("Cached London Firm", "cached-london-firm", 4.9m, 10),
+                    LastSeenAt = fetchedAt,
+                    ProfileFetchedAt = fetchedAt,
+                    ExpiresAt = fetchedAt.AddHours(24)
+                }
+            }
+        };
+        var gateway = new FakeSolicitorSearchGateway
+        {
+            SearchData = new SolicitorSearchData
+            {
+                Failures =
+                [
+                    new ScrapeFailure
+                    {
+                        Location = "London",
+                        Code = "searchPageFailed",
+                        Message = "Upstream failed."
+                    }
+                ]
+            }
+        };
+        var handler = CreateHandler(gateway, searchCache, profileCache, metrics);
+
+        var result = await handler.HandleAsync(
+            new RunConveyancingSolicitorSearchCommand
+            {
+                Locations = ["London"],
+                MinimumReviewScore = 4
+            },
+            CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(result.IsSuccess, Is.True);
+            Assert.That(metrics.Searches.Single().Status, Is.EqualTo("success"));
+            Assert.That(metrics.ListFetches, Is.Empty);
+            Assert.That(metrics.ProfileEnrichments.Single().FetchCount, Is.Zero);
+            Assert.That(metrics.ProfileEnrichments.Single().CacheHitCount, Is.EqualTo(1));
+            Assert.That(metrics.ProfileEnrichments.Single().CacheMissCount, Is.Zero);
+            Assert.That(metrics.Fallbacks, Is.Empty);
+            Assert.That(metrics.AllText, Does.Not.Contain("Cached London Firm"));
+            Assert.That(metrics.AllText, Does.Not.Contain("020 0000"));
         });
     }
 
@@ -394,7 +1161,11 @@ public class SolicitorSearchApplicationTests
         });
     }
 
-    private static RunConveyancingSolicitorSearchHandler CreateHandler(FakeSolicitorSearchGateway gateway)
+    private static RunConveyancingSolicitorSearchHandler CreateHandler(
+        FakeSolicitorSearchGateway gateway,
+        ISolicitorSearchCache? searchCache = null,
+        ISolicitorProfileCache? profileCache = null,
+        ISearchPerformanceMetrics? metrics = null)
     {
         var settings = new SolicitorSearchSettings
         {
@@ -411,13 +1182,16 @@ public class SolicitorSearchApplicationTests
         return new RunConveyancingSolicitorSearchHandler(
             new SolicitorSearchRequestValidator(options, new FakeLocationSuggestionGateway()),
             normalizer,
-            new SolicitorSearchScrapeService(gateway),
-            new SolicitorSearchProfileEnricher(gateway, sorter, options),
+            new SolicitorSearchScrapeService(gateway, metrics),
+            new SolicitorSearchProfileEnricher(gateway, sorter, options, profileCache, metrics: metrics),
             new SolicitorSearchFilter(),
             sorter,
             new SolicitorSearchResultFactory(
                 new SolicitorSearchPager(),
-                new SolicitorSearchReportBuilder()));
+                new SolicitorSearchReportBuilder()),
+            searchCache,
+            profileCache,
+            metrics);
     }
 
     private static SolicitorSearchSettings CreateSettings()
@@ -524,13 +1298,20 @@ public class SolicitorSearchApplicationTests
         public IReadOnlyDictionary<string, SolicitorProfile> Profiles { get; init; } =
             new Dictionary<string, SolicitorProfile>(StringComparer.OrdinalIgnoreCase);
 
+        public bool ThrowOnProfileFetch { get; init; }
+
+        public int SearchCount { get; private set; }
+
         public int ProfileFetchCount { get; private set; }
+
+        public IReadOnlyList<Solicitor> LastProfileFetchSolicitors { get; private set; } = [];
 
         public Task<SolicitorSearchData> SearchAsync(
             IReadOnlyList<string> locations,
             AreaOfLaw? areaOfLaw,
             CancellationToken cancellationToken)
         {
+            SearchCount++;
             SearchedLocations = locations;
             SearchedAreaOfLaw = areaOfLaw;
 
@@ -543,6 +1324,12 @@ public class SolicitorSearchApplicationTests
             CancellationToken cancellationToken)
         {
             ProfileFetchCount++;
+            LastProfileFetchSolicitors = solicitors;
+
+            if (ThrowOnProfileFetch)
+            {
+                throw new HttpRequestException("Profile fetch failed.");
+            }
 
             return Task.FromResult(Profiles);
         }
@@ -556,6 +1343,7 @@ public class SolicitorSearchApplicationTests
         {
             var locations = new[]
             {
+                "Birmingham",
                 "Bristol",
                 "Leeds",
                 "London"
@@ -567,6 +1355,160 @@ public class SolicitorSearchApplicationTests
 
             return Task.FromResult<IReadOnlyList<LocationSuggestionResult>>(suggestions);
         }
+    }
+
+    private class FakeSolicitorSearchCache : ISolicitorSearchCache
+    {
+        public Dictionary<string, SolicitorListCacheEntry> Segments { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        public List<SolicitorListCacheEntry> StoredSegments { get; } = [];
+
+        public int ReadCount { get; private set; }
+
+        public Task<SolicitorListCacheEntry?> GetListSegmentAsync(
+            string location,
+            string? areaOfLawSlug,
+            CancellationToken cancellationToken)
+        {
+            ReadCount++;
+            Segments.TryGetValue($"{location}|{areaOfLawSlug}", out var entry);
+
+            return Task.FromResult(entry);
+        }
+
+        public Task StoreListSegmentAsync(
+            SolicitorListCacheEntry entry,
+            CancellationToken cancellationToken)
+        {
+            StoredSegments.Add(entry);
+
+            return Task.CompletedTask;
+        }
+    }
+
+    private class FakeSolicitorProfileCache : ISolicitorProfileCache
+    {
+        public Dictionary<string, SolicitorProfileCacheRecord> Records { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        public List<SolicitorProfileCacheRecord> DiscoveredRecords { get; } = [];
+
+        public List<SolicitorProfileCacheRecord> ProfileRecords { get; } = [];
+
+        public int ReadCount { get; private set; }
+
+        public Task<IReadOnlyDictionary<string, SolicitorProfileCacheRecord>> GetBySourceIdentitiesAsync(
+            IReadOnlyCollection<string> sourceIdentities,
+            CancellationToken cancellationToken)
+        {
+            ReadCount++;
+            var matches = sourceIdentities
+                .Where(Records.ContainsKey)
+                .ToDictionary(identity => identity, identity => Records[identity], StringComparer.OrdinalIgnoreCase);
+
+            return Task.FromResult<IReadOnlyDictionary<string, SolicitorProfileCacheRecord>>(matches);
+        }
+
+        public Task UpsertDiscoveredSolicitorsAsync(
+            IReadOnlyList<SolicitorProfileCacheRecord> records,
+            CancellationToken cancellationToken)
+        {
+            DiscoveredRecords.AddRange(records);
+
+            return Task.CompletedTask;
+        }
+
+        public Task UpsertProfileDetailsAsync(
+            SolicitorProfileCacheRecord record,
+            CancellationToken cancellationToken)
+        {
+            ProfileRecords.Add(record);
+            Records[record.SourceIdentity] = record;
+
+            return Task.CompletedTask;
+        }
+    }
+
+    private class FakeSearchPerformanceMetrics : ISearchPerformanceMetrics
+    {
+        public List<RequestMetric> Requests { get; } = [];
+
+        public List<SearchMetric> Searches { get; } = [];
+
+        public List<ListFetchMetric> ListFetches { get; } = [];
+
+        public List<ProfileEnrichmentMetric> ProfileEnrichments { get; } = [];
+
+        public List<FallbackMetric> Fallbacks { get; } = [];
+
+        public string AllText => string.Join(
+            "|",
+            Requests.Select(request => $"{request.Route}:{request.StatusCode}:{request.FailureCategory}")
+                .Concat(Searches.Select(search => search.Status))
+                .Concat(ListFetches.Select(fetch => $"{fetch.Count}:{fetch.Status}"))
+                .Concat(ProfileEnrichments.Select(profile => $"{profile.FetchCount}:{profile.CacheHitCount}:{profile.CacheMissCount}:{profile.Status}"))
+                .Concat(Fallbacks.Select(fallback => $"{fallback.Stage}:{fallback.Result}")));
+
+        public void RecordRequest(
+            string route,
+            int statusCode,
+            string failureCategory,
+            TimeSpan elapsed)
+        {
+            Requests.Add(new RequestMetric(route, statusCode, failureCategory));
+        }
+
+        public void RecordSearch(
+            string status,
+            TimeSpan elapsed)
+        {
+            Searches.Add(new SearchMetric(status));
+        }
+
+        public void RecordListFetch(
+            int count,
+            string status,
+            TimeSpan elapsed)
+        {
+            ListFetches.Add(new ListFetchMetric(count, status));
+        }
+
+        public void RecordProfileEnrichment(
+            int fetchCount,
+            int cacheHitCount,
+            int cacheMissCount,
+            string status,
+            TimeSpan elapsed)
+        {
+            ProfileEnrichments.Add(new ProfileEnrichmentMetric(fetchCount, cacheHitCount, cacheMissCount, status));
+        }
+
+        public void RecordFallback(
+            string stage,
+            string result)
+        {
+            Fallbacks.Add(new FallbackMetric(stage, result));
+        }
+
+        public readonly record struct RequestMetric(
+            string Route,
+            int StatusCode,
+            string FailureCategory);
+
+        public readonly record struct SearchMetric(string Status);
+
+        public readonly record struct ListFetchMetric(
+            int Count,
+            string Status);
+
+        public readonly record struct ProfileEnrichmentMetric(
+            int FetchCount,
+            int CacheHitCount,
+            int CacheMissCount,
+            string Status);
+
+        public readonly record struct FallbackMetric(
+            string Stage,
+            string Result);
     }
 
     private class FakeAreaOfLawOptionsProvider : IAreaOfLawOptionsProvider
